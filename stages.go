@@ -232,7 +232,7 @@ func decideScore(keyword, q string) (float64, error) {
 			},
 		},
 	}
-	raw, err := postJSON(GW+"/systemone", body,
+	raw, err := postJSON(gwURL()+"/systemone", body,
 		map[string]string{"Authorization": "Bearer " + key()}, 120*time.Second)
 	if err != nil {
 		return 0, err
@@ -334,7 +334,7 @@ func srcES(kw string) ([]Result, error) {
 			"isi_teks": map[string]any{"fragment_size": 600, "number_of_fragments": 1},
 		}},
 	}
-	raw, err := postJSON(ESURL, body, nil, 60*time.Second)
+	raw, err := postJSON(esURL(), body, nil, 60*time.Second)
 	if err != nil {
 		return nil, err
 	}

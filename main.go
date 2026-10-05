@@ -232,6 +232,17 @@ func main() {
 	flag.CommandLine.Parse(reorderArgs(os.Args[1:])) //nolint:errcheck
 
 	if *printCfg {
+		// Konfigurasi efektif SETELAH .env dimuat. Nilai rahasia di-mask.
+		// Sumber: (.env) bila diisi loadDotEnv, (env) bila dari proses, (default) bila bukan keduanya.
+		src := func(k string) string {
+			if dotEnvKeys[k] {
+				return "(.env)"
+			}
+			if os.Getenv(k) != "" {
+				return "(env)"
+			}
+			return "(default)"
+		}
 		mask := func(s string) string {
 			if s == "" {
 				return "(KOSONG)"
@@ -241,8 +252,19 @@ func main() {
 			}
 			return s[:6] + "..." + s[len(s)-4:]
 		}
-		fmt.Printf("ST_GW    = %s\nST_ES    = %s\nST_KEY   = %s\nPORT     = %s\n",
-			GW, ESURL, mask(os.Getenv("ST_KEY")), env("PORT", "(tidak diset)"))
+		mcp := strings.Join(mcpCommand(), " ")
+		port := os.Getenv("PORT")
+		fmt.Printf("ST_GW         = %s %s\n", gwURL(), src("ST_GW"))
+		fmt.Printf("ST_ES         = %s %s\n", esURL(), src("ST_ES"))
+		fmt.Printf("ST_KEY        = %s %s\n", mask(key()), src("ST_KEY"))
+		fmt.Printf("ST_DB         = %s %s\n", dbPath(), src("ST_DB"))
+		fmt.Printf("ST_WORKERS    = %d %s\n", workerCount(), src("ST_WORKERS"))
+		fmt.Printf("ST_TURATH_MCP = %s %s\n", mcp, src("ST_TURATH_MCP"))
+		if port != "" {
+			fmt.Printf("PORT          = %s %s\n", port, src("PORT"))
+		} else {
+			fmt.Println("PORT          = (tidak diset)")
+		}
 		return
 	}
 	if *showVersion {

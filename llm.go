@@ -19,6 +19,10 @@ import (
 	"unicode/utf8"
 )
 
+// dotEnvKeys mencatat variabel yang benar-benar diisi dari file .env
+// (dipakai --print-config untuk menandai sumber).
+var dotEnvKeys = map[string]bool{}
+
 // loadDotEnv memuat pasangan KEY=VALUE dari .env bila variabelnya belum di-set.
 // Nilai yang sudah ada di environment tidak ditimpa (env > .env > default).
 func loadDotEnv(path string) {
@@ -39,14 +43,18 @@ func loadDotEnv(path string) {
 		v = strings.Trim(strings.TrimSpace(v), `"'`)
 		if k != "" && os.Getenv(k) == "" {
 			_ = os.Setenv(k, v)
+			dotEnvKeys[k] = true
 		}
 	}
 }
 
-var (
-	GW    = env("ST_GW", "http://localhost:20128/v1")
-	ESURL = env("ST_ES", "http://localhost:9200/konten_kitab/_search")
+// gwURL/esURL dibaca saat dipakai (setelah .env dimuat oleh main), bukan saat init,
+// supaya nilai dari .env tidak terkunci ke default.
+func gwURL() string { return env("ST_GW", "http://localhost:20128/v1") }
 
+func esURL() string { return env("ST_ES", "http://localhost:9200/konten_kitab/_search") }
+
+var (
 	turathURL = "https://api.turath.io/"
 	ketabURL  = "https://backend.ketabonline.com/api/v2/books/pages"
 )
@@ -107,7 +115,7 @@ type chatResponse struct {
 	Choices []chatChoice `json:"choices"`
 }
 
-// chat memanggil {GW}/chat/completions TANPA flag `stream`; retry 3x jeda 2 detik.
+// chat memanggil {gwURL()}/chat/completions TANPA flag `stream`; retry 3x jeda 2 detik.
 // Isi jawaban: content -> reasoning_content -> reasoning (beberapa model kn/*
 // menaruh hasil di `reasoning` dengan finish_reason=length).
 func chat(model, prompt, system string, maxTokens int, timeout time.Duration) (string, error) {
@@ -120,7 +128,7 @@ func chat(model, prompt, system string, maxTokens int, timeout time.Duration) (s
 
 	last := ""
 	for attempt := 0; attempt < 3; attempt++ {
-		raw, err := postJSON(GW+"/chat/completions", body,
+		raw, err := postJSON(gwURL()+"/chat/completions", body,
 			map[string]string{"Authorization": "Bearer " + key()}, timeout)
 		if err == nil {
 			var d chatResponse
