@@ -109,10 +109,27 @@ func run(q string, limit int, stages []string, useCache bool) map[string]any {
 		return rep
 	}
 
-	logf("5/5 kurasi + terjemahan via", curateModel)
+	logf("5/6 kurasi via", curateModel)
+	resetSearchNotes()
 	final, note := stageCurate(q, hits, max(limit, curateMin))
-	rep["hasil"] = final
 	st["curate"] = map[string]any{"catatan": note}
+	// Verifikasi halaman nukilan Turath (hanya yang akan ditampilkan) + backfill.
+	final, vp := stageVerifyPages(final, limit)
+	st["verify_pages"] = vp
+	logf("   verifikasi halaman:", vp["dicek"], "dicek,", vp["lolos"], "lolos,", vp["gagal"], "gagal")
+
+	logf("6/6 terjemahan via", translateModel)
+	final, tnote := stageTranslate(q, final)
+	st["translate"] = map[string]any{"jumlah": len(final), "model": translateModel, "catatan": tnote}
+	if len(final) == 0 {
+		logf("   peringatan: tidak ada hasil setelah verifikasi")
+	}
+	rep["hasil"] = final
+	if notes := drainSearchNotes(); len(notes) > 0 {
+		if sm, ok := st["search"].(map[string]any); ok {
+			sm["catatan"] = strings.Join(notes, " | ")
+		}
+	}
 	rep["durasi_detik"] = round(time.Since(t0).Seconds(), 1)
 	rep["pertanyaan"] = q
 
@@ -152,7 +169,7 @@ func mapOrDash(m map[string]any) any {
 // CLI Python menerima urutan bebas, jadi samakan perilakunya.
 func reorderArgs(args []string) []string {
 	// flag Go menerima -x maupun --x, jadi nama dinormalkan tanpa tanda hubung.
-	valueFlags := map[string]bool{"limit": true, "out": true, "stages": true, "serve": true}
+	valueFlags := map[string]bool{"limit": true, "out": true, "stages": true, "serve": true, "request": true, "requests": true}
 	var flags, pos []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -170,14 +187,48 @@ func reorderArgs(args []string) []string {
 	return append(flags, pos...)
 }
 
+// requestsCount = flag --requests dengan nilai opsional: dipakai tanpa angka
+// berarti tampilkan 20 riwayat terbaru. Default 0 = fitur tidak aktif.
+type requestsCount int
+
+func requestsFlag(def int) *requestsCount {
+	n := requestsCount(def)
+	return &n
+}
+
+func (r *requestsCount) String() string { return strconv.Itoa(int(*r)) }
+
+// IsBoolFlag membuat "--requests" tanpa nilai tetap valid (flag mengirim "true").
+func (r *requestsCount) IsBoolFlag() bool { return true }
+
+func (r *requestsCount) Set(s string) error {
+	switch s {
+	case "", "true":
+		*r = 20 // dipakai tanpa angka -> tampilkan 20 terbaru
+		return nil
+	case "false":
+		*r = 0
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("jumlah riwayat harus angka: %q", s)
+	}
+	*r = requestsCount(n)
+	return nil
+}
+
 func main() {
 	loadDotEnv(".env") // kredensial dari file .env (tidak di-commit); env yang sudah ada menang
 	limit := flag.Int("limit", 20, "jumlah hasil maksimal")
 	out := flag.String("out", "", "tulis JSON ke file ini")
-	stagesFlag := flag.String("stages", "keywords,merge,verify,search,curate", "tahap yang dijalankan, dipisah koma")
+	stagesFlag := flag.String("stages", "keywords,merge,verify,search,curate,translate", "tahap yang dijalankan, dipisah koma")
 	serve := flag.Int("serve", 0, "jalankan HTTP server di port ini")
+	reqID := flag.String("request", "", "cetak laporan tersimpan (request_id) dari SQLite")
+	reqList := requestsFlag(0)
 	showVersion := flag.Bool("version", false, "cetak versi lalu keluar")
 	printCfg := flag.Bool("print-config", false, "cetak konfigurasi efektif (env) lalu keluar")
+	flag.Var(reqList, "requests", "cetak riwayat ringkas (opsional jumlah, default 20)")
 	flag.CommandLine.Parse(reorderArgs(os.Args[1:])) //nolint:errcheck
 
 	if *printCfg {
@@ -208,7 +259,48 @@ func main() {
 		}
 	}
 	if port != 0 {
-		serveHTTP(port)
+		st, err := openStore(true)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gagal buka DB:", err)
+			os.Exit(1)
+		}
+		serveHTTP(port, st)
+		return
+	}
+
+	// --request <id>: cetak laporan tersimpan lalu keluar.
+	if *reqID != "" {
+		st, err := openStore(false)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gagal buka DB:", err)
+			os.Exit(1)
+		}
+		row, ok, err := st.get(*reqID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gagal baca DB:", err)
+			os.Exit(1)
+		}
+		if !ok {
+			fmt.Fprintf(os.Stderr, "request tidak dikenal: %s\n", *reqID)
+			os.Exit(1)
+		}
+		writeReport(reportOf(row), *out)
+		return
+	}
+
+	// --requests [n]: cetak riwayat ringkas lalu keluar.
+	if *reqList > 0 {
+		st, err := openStore(false)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gagal buka DB:", err)
+			os.Exit(1)
+		}
+		rows, err := st.list(int(*reqList))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gagal baca DB:", err)
+			os.Exit(1)
+		}
+		writeReport(map[string]any{"jumlah": len(rows), "requests": rows}, *out)
 		return
 	}
 
@@ -228,18 +320,23 @@ func main() {
 		}
 	}
 	rep := run(q, *limit, stages, true)
+	writeReport(rep, *out)
+}
+
+// writeReport mencetak JSON ke stdout atau menulis ke file bila out diset.
+func writeReport(rep map[string]any, out string) {
 	b, err := marshalJSON(rep, " ")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gagal marshal:", err)
 		os.Exit(1)
 	}
-	if *out != "" {
-		if err := os.WriteFile(*out, b, 0o644); err != nil {
+	if out != "" {
+		if err := os.WriteFile(out, b, 0o644); err != nil {
 			fmt.Fprintln(os.Stderr, "gagal tulis:", err)
 			os.Exit(1)
 		}
-		fmt.Printf("-> %s\n%s\n", *out, trunc(string(b), 1200))
-	} else {
-		fmt.Println(string(b))
+		fmt.Printf("-> %s\n%s\n", out, trunc(string(b), 1200))
+		return
 	}
+	fmt.Println(string(b))
 }

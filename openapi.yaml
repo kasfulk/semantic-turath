@@ -3,11 +3,14 @@ info:
   title: Semantic Turath
   description: >
     Cari nukilan perkataan ulama dari pertanyaan bebas Bahasa Indonesia.
-    Pipeline 5 tahap: keyword Arab (4 model kn/*), merge (agnes/agnes-3.0-flash),
+    Pipeline 6 tahap: keyword Arab (4 model kn/*), merge (agnes/agnes-3.0-flash),
     verifikasi relevansi (mercury-decide, noul), pencarian 3 sumber
-    (ES konten_kitab, api.turath.io, backend.ketabonline.com),
-    kurasi + terjemahan Indonesia (agnes/agnes-3.0-flash).
-  version: 1.0.0
+    (ES konten_kitab langsung, Turath via MCP stdio, backend.ketabonline.com langsung),
+    kurasi relevansi (agnes/agnes-3.0-flash) + verifikasi halaman Turath, lalu
+    terjemahan Indonesia (kn-b/deepseek-v4-1-flash).
+    Permintaan bersifat async: POST /ask mengembalikan request_id (HTTP 202),
+    hasil diambil lewat GET /request?id=...
+  version: 2.0.0
 servers:
   - url: http://localhost:20052
     description: Lokal
@@ -26,12 +29,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/Health"
   /ask:
-    get:
-      summary: Tanya nukilan ulama
+    post:
+      summary: Kirim pertanyaan (async)
       description: >
-        Menjalankan pipeline penuh. Run dingin sekitar 5 menit; pertanyaan
-        yang sama dibalas dari cache (< 1 detik). Hasil dipotong sesuai limit.
-      operationId: ask
+        Menyimpan permintaan ke antrian dan langsung membalas 202 dengan
+        request_id. Pipeline berat dijalankan worker (ST_WORKERS, default 1).
+        Ambil hasil lewat GET /request?id=... Pertanyaan identik yang masih
+        queued/running dalam 15 menit terakhir mengembalikan request_id yang sama.
+      operationId: askPost
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AskRequest"
+      responses:
+        "202":
+          description: Permintaan masuk antrian
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AskAccepted"
+        "400":
+          description: Parameter q kosong
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      summary: Kirim pertanyaan via query (async)
+      description: Sama seperti POST /ask, untuk kompatibilitas.
+      operationId: askGet
       parameters:
         - name: q
           in: query
@@ -39,7 +67,7 @@ paths:
           description: Pertanyaan bebas Bahasa Indonesia
           schema:
             type: string
-          example: hukum makan keong
+          example: dalil sholat 5 waktu
         - name: limit
           in: query
           required: false
@@ -50,24 +78,75 @@ paths:
             maximum: 50
             default: 20
       responses:
-        "200":
-          description: Hasil pipeline
+        "202":
+          description: Permintaan masuk antrian
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AskResponse"
+                $ref: "#/components/schemas/AskAccepted"
         "400":
           description: Parameter q kosong
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-        "404":
-          description: Path tidak dikenal
+  /request:
+    get:
+      summary: Ambil hasil satu permintaan
+      description: >
+        status queued/running -> hanya metadata; status done -> laporan lengkap
+        (isi hasil_json + request_id, status, pertanyaan, durasi_detik, dibuat);
+        status error -> laporan + field error.
+      operationId: getRequest
+      parameters:
+        - name: id
+          in: query
+          required: true
+          description: request_id dari POST /ask
+          schema:
+            type: string
+          example: req_0123456789ab
+      responses:
+        "200":
+          description: Metadata atau laporan lengkap
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestReport"
+        "400":
+          description: Parameter id kosong
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "404":
+          description: request_id tidak dikenal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /requests:
+    get:
+      summary: Riwayat permintaan
+      description: Daftar ringkas terbaru dulu (maks 100).
+      operationId: listRequests
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Jumlah baris (default 20, maks 100)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: Daftar riwayat
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestList"
         "500":
           description: Error internal
           content:
@@ -100,7 +179,7 @@ components:
   schemas:
     Health:
       type: object
-      required: [status, sumber, port]
+      required: [status, sumber, port, antrian, workers, db]
       properties:
         status:
           type: string
@@ -113,6 +192,20 @@ components:
         port:
           type: integer
           example: 20052
+        antrian:
+          type: integer
+          description: jumlah request queued + running
+          example: 0
+        workers:
+          type: integer
+          description: jumlah worker pipeline (ST_WORKERS)
+          example: 1
+        db:
+          type: string
+          enum: [ok, error]
+          description: status koneksi SQLite
+        error:
+          type: string
     Error:
       type: object
       properties:
@@ -209,9 +302,26 @@ components:
                 per_sumber:
                   type: object
                   additionalProperties: { type: integer }
+                catatan:
+                  type: string
+                  description: catatan sumber, mis. Turath memakai fallback HTTP
             curate:
               type: object
               properties:
+                catatan: { type: string }
+            verify_pages:
+              type: object
+              description: verifikasi nukilan Turath lewat MCP turath_get_page (maks 12, sekuensial)
+              properties:
+                dicek: { type: integer }
+                lolos: { type: integer }
+                gagal: { type: integer }
+                catatan: { type: string }
+            translate:
+              type: object
+              properties:
+                jumlah: { type: integer }
+                model: { type: string, example: kn-b/deepseek-v4-1-flash }
                 catatan: { type: string }
         keywords_mentah:
           type: array
@@ -230,3 +340,71 @@ components:
         dari_cache:
           type: boolean
           description: true bila jawaban dilayani dari cache
+    AskRequest:
+      type: object
+      required: [q]
+      properties:
+        q:
+          type: string
+          description: Pertanyaan bebas Bahasa Indonesia
+          example: dalil sholat 5 waktu
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+    AskAccepted:
+      type: object
+      required: [request_id, status, pertanyaan, limit]
+      properties:
+        request_id:
+          type: string
+          example: req_0123456789ab
+        status:
+          type: string
+          enum: [queued]
+        pertanyaan:
+          type: string
+        limit:
+          type: integer
+    RequestReport:
+      type: object
+      description: >
+        queued/running: request_id, status, pertanyaan, dibuat.
+        done: laporan lengkap (seluruh isi AskResponse + request_id/status/durasi_detik/dibuat).
+        error: laporan + field error.
+      required: [request_id, status, pertanyaan, dibuat]
+      properties:
+        request_id: { type: string }
+        status:
+          type: string
+          enum: [queued, running, done, error]
+        pertanyaan: { type: string }
+        dibuat: { type: string, format: date-time }
+        mulai: { type: string, format: date-time, nullable: true }
+        selesai: { type: string, format: date-time, nullable: true }
+        durasi_detik: { type: number, nullable: true }
+        error: { type: string, nullable: true }
+        hasil:
+          type: array
+          items: { $ref: "#/components/schemas/Hasil" }
+        stages: { type: object }
+    RequestSummary:
+      type: object
+      required: [request_id, pertanyaan, status, dibuat]
+      properties:
+        request_id: { type: string }
+        pertanyaan: { type: string }
+        status:
+          type: string
+          enum: [queued, running, done, error]
+        dibuat: { type: string, format: date-time }
+        durasi_detik: { type: number, nullable: true }
+    RequestList:
+      type: object
+      required: [jumlah, requests]
+      properties:
+        jumlah: { type: integer }
+        requests:
+          type: array
+          items: { $ref: "#/components/schemas/RequestSummary" }

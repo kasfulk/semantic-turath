@@ -21,9 +21,10 @@ var genModels = []string{
 }
 
 const (
-	mergeModel  = "agnes/agnes-3.0-flash"
-	curateModel = "agnes/agnes-3.0-flash"
-	decideModel = "openrouter/inception/mercury-decide:free"
+	mergeModel     = "agnes/agnes-3.0-flash"
+	curateModel    = "agnes/agnes-3.0-flash"
+	translateModel = "kn-b/deepseek-v4-1-flash"
+	decideModel    = "openrouter/inception/mercury-decide:free"
 
 	scoreMin       = 0.5
 	perSource      = 8
@@ -31,6 +32,7 @@ const (
 	candidateCap   = 60
 	curateBatch    = 20
 	curateMin      = 20
+	translateBatch = 10
 )
 
 // ------------------------------------------------------------- 1. keyword gen
@@ -310,6 +312,10 @@ type Result struct {
 	SkorDecide  *float64 `json:"skor_decide"`
 	Terjemahan  string   `json:"terjemahan,omitempty"`
 	Alasan      *string  `json:"alasan,omitempty"`
+
+	// TurathMCP menandai nukilan Turath dari MCP (perlu verifikasi halaman).
+	// Unexported-tidak; di-exclude dari JSON supaya kontrak keluaran tetap sama.
+	TurathMCP bool `json:"-"`
 }
 
 var lokasiRe = regexp.MustCompile(`الجزء:\s*(\d+)\s*¦\s*الصفحة:\s*(\d+)`)
@@ -368,8 +374,64 @@ func srcES(kw string) ([]Result, error) {
 	return out, nil
 }
 
+// srcTurath mengambil nukilan Turath lewat MCP stdio (turath_search). Kalau MCP
+// gagal, jatuh ke HTTP langsung (perilaku lama) dan mencacat fallback.
 func srcTurath(kw string) ([]Result, error) {
-	d, err := jget(turathURL, url.Values{"q": {kw}, "ver": {"3"}}, 60*time.Second)
+	text, err := mcpToolText("turath_search", map[string]any{"query": kw, "page": 1}, mcpTimeout)
+	if err != nil {
+		addSearchNote("Turath via HTTP (fallback): " + err.Error())
+		return srcTurathHTTP(kw)
+	}
+	var d struct {
+		Count int `json:"count"`
+		Data  []struct {
+			BookID   any    `json:"book_id"`
+			CatID    any    `json:"cat_id"`
+			AuthorID any    `json:"author_id"`
+			Meta     string `json:"meta"`
+			Snip     string `json:"snip"`
+			Text     string `json:"text"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(text), &d); err != nil {
+		addSearchNote("Turath balasan MCP tidak valid: " + err.Error())
+		return srcTurathHTTP(kw)
+	}
+	items := d.Data
+	if len(items) > perSource {
+		items = items[:perSource]
+	}
+	out := []Result{}
+	for _, m := range items {
+		meta := map[string]any{}
+		if m.Meta != "" {
+			var parsed any
+			if json.Unmarshal([]byte(m.Meta), &parsed) == nil {
+				meta = asMap(parsed)
+			}
+		}
+		snip := m.Snip
+		if strings.TrimSpace(snip) == "" {
+			snip = m.Text
+		}
+		loc := fmt.Sprintf("juz %s hlm %s", pyStr(meta["vol"]), pyStr(meta["page"]))
+		out = append(out, Result{
+			Sumber:     "Turath.io",
+			JudulKitab: asString(meta["book_name"]),
+			Penulis:    asString(meta["author_name"]),
+			KitabID:    m.BookID,
+			Lokasi:     &loc,
+			Nukilan:    trunc(stripHTML(snip), 1200),
+			Keyword:    kw,
+			TurathMCP:  true,
+		})
+	}
+	return out, nil
+}
+
+// srcTurathHTTP = perilaku lama (langsung ke api.turath.io).
+func srcTurathHTTP(kw string) ([]Result, error) {
+	d, err := jget(turathURL+"search", url.Values{"q": {kw}, "ver": {"3"}}, 60*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -519,10 +581,22 @@ Berikut {n} nukilan dari kitab kuning (Maktabah Syamilah / Turath.io / Ketabonli
 Tugas:
 1. Buang nukilan yang tidak menjawab pertanyaan (indeks, katalog, definisi kamus, gramatika, teks rusak).
 2. Urutkan sisanya dari paling relevan.
-3. Terjemahkan tiap nukilan yang lolos ke Bahasa Indonesia (ringkas, setia makna).
 
 Balas HANYA JSON array, maksimal {limit} item:
-[{"idx":<nomor nukilan>,"relevan":true,"terjemahan":"...","alasan":"<1 frasa>"}]`
+[{"idx":<nomor nukilan>,"relevan":true,"alasan":"<1 frasa>"}]`
+
+// translatePromptTpl = prompt tahap terjemah (terpisah dari kurasi).
+const translatePromptTpl = `Pertanyaan user: "{q}"
+
+Berikut {n} nukilan kitab kuning yang sudah lolos kurasi:
+{items}
+
+Tugas: terjemahkan SETIAP nukilan di atas ke Bahasa Indonesia (ringkas, setia makna,
+tanpa komentar, tanpa tashih, tanpa catatan tambahan).
+
+Balas HANYA JSON array datar (bukan objek), berisi tepat {n} item, satu per nukilan,
+urut nomor nukilan, tanpa pagar kode dan tanpa teks lain:
+[{"idx":0,"terjemahan":"..."},{"idx":1,"terjemahan":"..."}]`
 
 // truthy meniru Python: None/False/0/"" itu falsy.
 func truthy(v any) bool {
@@ -592,9 +666,6 @@ func stageCurate(q string, results []Result, limit int) ([]Result, string) {
 				continue
 			}
 			r := chunk[idx]
-			if s, ok := m["terjemahan"].(string); ok {
-				r.Terjemahan = strings.TrimSpace(s)
-			}
 			r.Alasan = asString(m["alasan"])
 			out = append(out, r)
 			if len(out) >= limit {
@@ -607,6 +678,125 @@ func stageCurate(q string, results []Result, limit int) ([]Result, string) {
 		note += " | error: " + strings.Join(notes, "; ")
 	}
 	return out, note
+}
+
+// stageTranslate menerjemahkan nukilan yang akan ditampilkan (hanya yang lolos
+// kurasi) ke Bahasa Indonesia, batch translateBatch per panggilan. Batch yang
+// gagal hanya dicatat, tidak menghentikan pipeline.
+func stageTranslate(q string, results []Result) ([]Result, string) {
+	if len(results) == 0 {
+		return results, "tidak ada nukilan untuk diterjemahkan"
+	}
+	notes := []string{}
+	for start := 0; start < len(results); start += translateBatch {
+		end := min(start+translateBatch, len(results))
+		chunk := results[start:end] // slice berbagi backing array: mutasi di sini ikut terlihat
+		parts := make([]string, len(chunk))
+		for i, r := range chunk {
+			parts[i] = fmt.Sprintf("[%d] (%s) %s — %s\n%s",
+				i, r.Sumber, orDash(r.JudulKitab), orDash(r.Penulis),
+				trunc(r.Nukilan, candidateChars))
+		}
+		prompt := strings.NewReplacer(
+			"{q}", q,
+			"{n}", fmt.Sprint(len(chunk)),
+			"{items}", strings.Join(parts, "\n\n"),
+		).Replace(translatePromptTpl)
+
+		raw, err := chat(translateModel, prompt, genSystem, 8000, 600*time.Second)
+		if err != nil {
+			notes = append(notes, fmt.Sprintf("batch %d: %s", start, err.Error()))
+			continue
+		}
+		n := 0
+		for _, m := range extractTranslated(firstJSON(raw)) {
+			idx, ok := itemIdx(m, len(chunk))
+			if !ok {
+				continue
+			}
+			if s := itemText(m); s != "" {
+				chunk[idx].Terjemahan = s
+				n++
+			}
+		}
+		if n == 0 {
+			notes = append(notes, fmt.Sprintf("batch %d: tidak ada terjemahan terparse", start))
+		}
+	}
+	n := 0
+	for _, r := range results {
+		if r.Terjemahan != "" {
+			n++
+		}
+	}
+	note := fmt.Sprintf("%d/%d nukilan diterjemahkan", n, len(results))
+	if len(notes) > 0 {
+		note += " | error: " + strings.Join(notes, "; ")
+	}
+	return results, note
+}
+
+// extractTranslated menormalkan bentuk balasan model jadi daftar item: array
+// langsung, {"results":[...]}, {"data":[...]}, atau satu objek tunggal.
+func extractTranslated(v any) []map[string]any {
+	out := []map[string]any{}
+	add := func(x any) {
+		switch t := x.(type) {
+		case map[string]any:
+			out = append(out, t)
+		case []any:
+			for _, it := range t {
+				if m, ok := it.(map[string]any); ok {
+					out = append(out, m)
+				}
+			}
+		}
+	}
+	switch t := v.(type) {
+	case []any:
+		add(t)
+	case map[string]any:
+		found := false
+		for _, k := range []string{"results", "data", "items", "hasil", "translations"} {
+			switch inner := t[k].(type) {
+			case []any, map[string]any:
+				add(inner)
+				found = true
+			}
+		}
+		if !found {
+			add(t)
+		}
+	}
+	return out
+}
+
+// itemIdx menerima penanda nomor nukilan dari model (idx/id/nomor/number/index),
+// bisa angka JSON atau string.
+func itemIdx(m map[string]any, n int) (int, bool) {
+	for _, k := range []string{"idx", "id", "nomor", "number", "index", "no"} {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		if i := asIdx(v, n); i >= 0 {
+			return i, true
+		}
+		if i, ok := asInt(v); ok && i >= 0 && i < n {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// itemText menerima teks terjemahan dari beberapa nama field yang mungkin.
+func itemText(m map[string]any) string {
+	for _, k := range []string{"terjemahan", "translation", "arti", "text", "teks", "quote", "hasil"} {
+		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 func orDash(s *string) string {
