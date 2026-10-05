@@ -1,0 +1,232 @@
+openapi: 3.0.3
+info:
+  title: Semantic Turath
+  description: >
+    Cari nukilan perkataan ulama dari pertanyaan bebas Bahasa Indonesia.
+    Pipeline 5 tahap: keyword Arab (4 model kn/*), merge (agnes/agnes-3.0-flash),
+    verifikasi relevansi (mercury-decide, noul), pencarian 3 sumber
+    (ES konten_kitab, api.turath.io, backend.ketabonline.com),
+    kurasi + terjemahan Indonesia (agnes/agnes-3.0-flash).
+  version: 1.0.0
+servers:
+  - url: http://localhost:20052
+    description: Lokal
+  - url: http://0.0.0.0:20052
+    description: Semua interface (LAN)
+paths:
+  /health:
+    get:
+      summary: Status service
+      operationId: health
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /ask:
+    get:
+      summary: Tanya nukilan ulama
+      description: >
+        Menjalankan pipeline penuh. Run dingin sekitar 5 menit; pertanyaan
+        yang sama dibalas dari cache (< 1 detik). Hasil dipotong sesuai limit.
+      operationId: ask
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Pertanyaan bebas Bahasa Indonesia
+          schema:
+            type: string
+          example: hukum makan keong
+        - name: limit
+          in: query
+          required: false
+          description: Jumlah hasil maksimal (1..50)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        "200":
+          description: Hasil pipeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AskResponse"
+        "400":
+          description: Parameter q kosong
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Path tidak dikenal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Error internal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /swagger/:
+    get:
+      summary: Swagger/RapiDoc UI
+      operationId: swaggerUI
+      responses:
+        "200":
+          description: Halaman HTML RapiDoc
+          content:
+            text/html:
+              schema:
+                type: string
+  /swagger/openapi.yaml:
+    get:
+      summary: Spesifikasi OpenAPI ini
+      operationId: swaggerSpec
+      responses:
+        "200":
+          description: Dokumen OpenAPI 3.0
+          content:
+            application/yaml:
+              schema:
+                type: string
+components:
+  schemas:
+    Health:
+      type: object
+      required: [status, sumber, port]
+      properties:
+        status:
+          type: string
+          example: ok
+        sumber:
+          type: array
+          items:
+            type: string
+          example: [konten_kitab, turath.io, ketabonline]
+        port:
+          type: integer
+          example: 20052
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+    Keyword:
+      type: object
+      properties:
+        text:
+          type: string
+          description: Keyword Arab
+        min_kalimat:
+          type: integer
+        model:
+          type: string
+        skor:
+          type: number
+          format: float
+          nullable: true
+          description: Skor relevansi noul 0..1 dari mercury-decide
+        error:
+          type: string
+    Hasil:
+      type: object
+      properties:
+        sumber:
+          type: string
+          enum: [Maktabah Syamilah, Turath.io, Ketabonline]
+        judul_kitab:
+          type: string
+          nullable: true
+        penulis:
+          type: string
+          nullable: true
+        kategori:
+          type: string
+          nullable: true
+        kitab_id: {}
+        lokasi:
+          type: string
+          nullable: true
+          description: "juz N hlm M"
+        nukilan:
+          type: string
+          description: Nukilan Arab, maks 1200 char
+        keyword:
+          type: string
+          description: Keyword Arab pencetus
+        skor_mekanis:
+          type: number
+          format: float
+        skor_decide:
+          type: number
+          format: float
+          nullable: true
+        terjemahan:
+          type: string
+          description: Terjemahan Indonesia dari kurasi
+        alasan:
+          type: string
+          nullable: true
+    AskResponse:
+      type: object
+      properties:
+        pertanyaan:
+          type: string
+        stages:
+          type: object
+          properties:
+            keywords:
+              type: object
+              properties:
+                jumlah: { type: integer }
+                per_model:
+                  type: object
+                  additionalProperties: { type: integer }
+                error:
+                  type: object
+                  additionalProperties: { type: string }
+            merge:
+              type: object
+              properties:
+                jumlah: { type: integer }
+            verify:
+              type: object
+              properties:
+                dinilai: { type: integer }
+                lolos: { type: integer }
+                ambang: { type: number }
+            search:
+              type: object
+              properties:
+                nukilan_mentah: { type: integer }
+                per_sumber:
+                  type: object
+                  additionalProperties: { type: integer }
+            curate:
+              type: object
+              properties:
+                catatan: { type: string }
+        keywords_mentah:
+          type: array
+          items: { $ref: "#/components/schemas/Keyword" }
+        keywords_merged:
+          type: array
+          items: { $ref: "#/components/schemas/Keyword" }
+        keywords_scored:
+          type: array
+          items: { $ref: "#/components/schemas/Keyword" }
+        hasil:
+          type: array
+          items: { $ref: "#/components/schemas/Hasil" }
+        durasi_detik:
+          type: number
+        dari_cache:
+          type: boolean
+          description: true bila jawaban dilayani dari cache
